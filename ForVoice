@@ -1,0 +1,86 @@
+private void ProcessRecording(int _stopRecordPosition, bool _isMuted, BytesWriter _writer)
+    {
+        int currentPosition = CustomMicrophone.GetPosition(_microphoneDevice); //EveryFrame get the position to access the current position, and apply the signals to our buffer array.
+
+        // fix for end record incorrect position
+        if (_stopRecordPosition != -1)
+            currentPosition = _stopRecordPosition;
+
+        if ((currentPosition != _LastPos) && !_isMuted)
+        {
+            if (CustomMicrophone.GetRawData(ref _rawSamples, _MyAudioClip))
+            {
+                if (_LastPos != currentPosition && _rawSamples.Length > 0)
+                {
+                    // Detects does user says something based on volume level
+                    if (!GeneralConfig.Config.voiceDetectionEnabled || CustomMicrophone.IsVoiceDetected(_rawSamples, ref _averageVoiceLevel, GeneralConfig.Config.voiceDetectionThreshold))
+                    {
+                        if (_LastPos > currentPosition)
+                        {
+                            _buffer.AddRange(GetChunk(_rawSamples, _LastPos, _rawSamples.Length - _LastPos));
+                            _buffer.AddRange(GetChunk(_rawSamples, 0, currentPosition));
+                        }
+                        else
+                        {
+                            _buffer.AddRange(GetChunk(_rawSamples, _LastPos, currentPosition - _LastPos));
+                        }
+                    }
+
+                    // sends data chunky
+                    if (_buffer.Count >= Constants.ChunkSize)
+                    {
+                        SendDataToNetwork(_buffer.GetRange(0, Constants.ChunkSize), _writer);
+                        _buffer.RemoveRange(0, Constants.ChunkSize);
+                    }
+                }
+            }
+
+            _LastPos = currentPosition;
+        }
+        else
+        {
+            _LastPos = currentPosition;
+
+            if (_buffer.Count > 0)
+            {
+                // sends left data chunky
+                if (_buffer.Count >= Constants.ChunkSize)
+                {
+                    SendDataToNetwork(_buffer.GetRange(0, Constants.ChunkSize), _writer);
+                    _buffer.RemoveRange(0, Constants.ChunkSize);
+                }
+                // sends all left data
+                else
+                {
+                    SendDataToNetwork(_buffer, _writer);
+                    _buffer.Clear();
+                }
+            }
+        }
+    }
+
+    private T[] GetChunk<T>(T[] data, int index, int length)
+    {
+        if (data.Length < index + length)
+            throw new Exception("Input array less than parameters income!");
+
+        T[] result = new T[length];
+        Array.Copy(data, index, result, 0, length);
+        return result;
+    }
+
+    private void SendDataToNetwork(List<float> buffer, BytesWriter _writer)
+    {
+        //if want to use mic in webRtc should use these
+        {
+		//Same with image, from float to byte to compress data, and when read we will translate it back to float.
+            //byte[] bytes = CustomMicrophone.FloatToByte(buffer.ToArray());
+            //bytes = Compressor.Compress(bytes);
+            //Debug.LogWarning("bytes length: " + bytes.Length);
+            //_writer.WriteByteArray(bytes);
+            //Debug.LogWarning("Writerbytes Total length: " + _writer.Bytes.Length);
+        }
+
+        SendDataToWebRTcServer(_writer);
+    }
+    **/

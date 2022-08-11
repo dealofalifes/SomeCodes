@@ -1,0 +1,986 @@
+using UnityEngine;
+using UnityEngine.UI;
+using Adrenak.AirPeer;
+using System.IO;
+using System.Linq;
+using System;
+using FrostweepGames.Plugins.Native;
+using System.Collections.Generic;
+using Photon.Pun;
+using Photon.Realtime;
+using Hashtable = ExitGames.Client.Photon.Hashtable;
+using FrostweepGames.VoicePro;
+using System.Collections;
+using UnityEngine.SceneManagement;
+
+public class VideoCallMain : MonoBehaviour
+{
+    [SerializeField] private string _microphoneDevice;
+
+    private WebCamTexture _BackCam;
+    [SerializeField] private SoundInput _SoundInput;
+    [SerializeField] private Texture2D _WaitingBgForStream, _NoCameraTexture;
+
+    [SerializeField] private AudioSource _AudioSource, _MyAudioSource;
+    private AudioClip _MyAudioClip;
+    private int _LastPos, _Pos, _SampleRate, _DisconnectedAmount;
+
+    [SerializeField] private List<GameObject> _NearPlayersInSameServer = new List<GameObject>();
+    private List<string> _MutedPlayersList = new List<string>();
+    [SerializeField] private List<string> _ShownPlayersList = new List<string>();
+    [SerializeField] private List<short> _LeavingPlayersList = new List<short>();
+
+    [SerializeField] private Vector3[] _Resolutions;
+
+    [SerializeField] private RawImage _Background;
+    [SerializeField] private RawImage[] _DestinationBgRight, _DestinationBgUp;
+    private float _Time, _RestTimer, _DisconnectedTimer, _InvalidIDTimer;
+    private GuestController _GuestController;
+    private PlayerController _PlayerController;
+
+    private int _WidthMyCam, _HeightMyCam, _Width, _Height, _MyServerID, _ResolationSetting;
+
+    [SerializeField] private string _CurrentServerName, _TemporaryServerName;
+    [SerializeField] private int _CurrentPlayerCount, _DeviceStatus;
+    private bool _MutedAllVoices, _ServerOverloaded, _OnRefresh;
+    [SerializeField] private Button[] _PlayerNameButtonList;
+    //[SerializeField] private Recorder recorder;
+    public bool BusyNow, BusyJoining, BusyClosing;
+
+    private List<float> _buffer;
+    private float[] _rawSamples;
+
+    public string MyName;
+
+    [SerializeField] private float _averageVoiceLevel = 0f;
+
+    APNode node;
+    string SignalingServerURL;
+    public enum StreamState
+    {
+        NORMALSTREAMING,
+        ONLYVIDEO,
+        ALLCLOSE,
+        TRYINGTOCONNECT
+    }
+
+    private void Start()
+    {
+        SignalingServerURL = Velaverse.Constant.SignalingServerURL;
+
+        _ResolationSetting = 1;
+        SetResolution(_ResolationSetting);
+        _SampleRate = 16000;
+        _buffer = new List<float>();
+        _rawSamples = new float[Constants.RecordingTime * _SampleRate];
+
+        _DisconnectedAmount = 0; _DisconnectedTimer = 20;
+        _MutedAllVoices = false;
+        _Background.gameObject.SetActive(false);
+        _BackCam = new WebCamTexture(_WidthMyCam, _HeightMyCam, 5);
+
+        _MyAudioSource.clip = _MyAudioClip;
+        ResetStreamObjects();
+        CreateTheServerSystem();
+        SetCameraDeviceState(false);
+    }
+
+    public void SetMicIcon(bool isRecording)
+    {
+        UIVideoCall _UIvideocall = GetComponent<UIVideoCall>();
+        _UIvideocall.SetMicIcon(isRecording);
+    }
+
+    private void ResetStreamObjects()
+    {
+        foreach (var item in _PlayerNameButtonList)
+            item.gameObject.SetActive(false);
+
+        int length = _NearPlayersInSameServer.Count;
+        Debug.LogWarning("Near players count in same server: " + length);
+        if (length == 0)
+        {
+            GetComponent<UIVideoCall>().CloseTheHeaders(false);
+            for (int i = 0; i < 5; i++)
+            {
+                _DestinationBgUp[i].texture = _NoCameraTexture;
+                _DestinationBgRight[i].texture = _NoCameraTexture;
+                _DestinationBgUp[i].gameObject.SetActive(false);
+                _DestinationBgRight[i].gameObject.SetActive(false);
+            }
+        }
+        else
+        {
+            GetComponent<UIVideoCall>().CloseTheHeaders(true);
+            for (int i = 0; i < length; i++)
+            {
+                if (_NearPlayersInSameServer[i] != null)
+                {
+                    TMPro.TextMeshProUGUI PlayerName = _PlayerNameButtonList[i].transform.GetChild(0).GetComponent<TMPro.TextMeshProUGUI>();
+                    //string name = _NearPlayersInSameServer[i].GetComponent<PhotonView>().Owner.NickName;
+                    //string name = Velaverse.GameController.instance.gameData.characterData.nickname;
+                    string name = _NearPlayersInSameServer[i].GetComponent<PhotonPlayer>()._PlayerName.text;
+                    PlayerName.text = name;
+                    int thisLength = _ShownPlayersList.Count;
+                    if (thisLength > 0)
+                    {
+                        for (int x = 0; x < thisLength; x++)
+                        {
+                            if (_ShownPlayersList[x].Contains(name))
+                            {
+                                _DestinationBgUp[i].gameObject.SetActive(true);
+                                _DestinationBgRight[i].gameObject.SetActive(true);
+                                break;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        foreach (var item in _DestinationBgUp)
+                        {
+                            item.texture = _NoCameraTexture;
+                            item.gameObject.SetActive(false);
+                        }
+                        foreach (var item in _DestinationBgRight)
+                        {
+                            item.texture = _NoCameraTexture;
+                            item.gameObject.SetActive(false);
+                        }
+                            
+                    }
+
+                    _PlayerNameButtonList[i].gameObject.SetActive(true);
+                }
+            }
+            for (int i = length; i < 5; i++)
+            {
+                _DestinationBgUp[i].texture = _NoCameraTexture;
+                _DestinationBgRight[i].texture = _NoCameraTexture;
+                _DestinationBgUp[i].gameObject.SetActive(false);
+                _DestinationBgRight[i].gameObject.SetActive(false);
+            }
+        }
+    }
+
+    public void SetStreamScreensOff()
+    {
+        for (int i = 0; i < 5; i++)
+        {
+            _DestinationBgUp[i].texture = _NoCameraTexture;
+            _DestinationBgRight[i].texture = _NoCameraTexture;
+            _DestinationBgUp[i].gameObject.SetActive(false);
+            _DestinationBgRight[i].gameObject.SetActive(false);
+            _PlayerNameButtonList[i].gameObject.SetActive(false);
+        }
+    }
+
+    private void Update()
+    {
+        if (node.CurrentMode != APNode.Mode.Idle && !BusyClosing)
+        {
+            _Time -= Time.deltaTime;
+            if (_Time < 0)
+            {
+                CheckTheServerThread();
+                StreamVideo();
+                //localVdoCall();
+                //localVoiceChat();
+                _Time = 0.1f;
+            }
+        }
+        /**
+         
+        if (_ServerOverloaded)
+        {
+
+            if (_RestTimer < 0)
+            {
+                _ServerOverloaded = false;
+                return;
+            }
+            else
+                _RestTimer -= Time.deltaTime;
+        }
+        if (_DisconnectedAmount > 0)
+        {
+            if (_DisconnectedAmount >= 3)
+            {
+                RefreshServer();
+            }
+            _DisconnectedTimer -= Time.deltaTime;
+            if (_DisconnectedTimer < 0)
+            {
+                _DisconnectedAmount = 0;
+                _DisconnectedTimer = 10;
+            }
+        }
+
+        **/
+    }
+    private void FixedUpdate()
+    {
+        if (_NearPlayersInSameServer.Count == 0)
+        {
+            SetStreamScreensOff();
+        }
+        else
+        {
+            ResetStreamObjects();
+        }
+    }
+
+    public void StreamVideo()
+    {
+        if (node != null && _BackCam != null)
+        {
+            var writer = new BytesWriter();
+            if (_DeviceStatus == 0 || _DeviceStatus == 1)
+            {
+                Texture2D snap = new Texture2D(_BackCam.width, _BackCam.height);
+                snap.SetPixels32(_BackCam.GetPixels32());
+                snap.Apply();
+                writer.WriteByteArray(GetResizeText(snap).EncodeToJPG());
+            }
+            SendDataToWebRTcServer(writer);
+        }
+    }
+    private void OnDestroy()
+    {
+        BusyClosing = true;
+        LeaveRoom();
+    }
+
+    //To decrease size of images in video
+    public Texture2D GetResizeText(Texture2D oldTex)
+    {
+        Func<Texture2D, int, int, Color> convert = delegate (Texture2D tex, int X, int Y)
+        {
+            float scaleI = tex.width / (float)_Width;
+            float scaleJ = tex.height / (float)_Height;
+            int I = (int)(scaleI * X);
+            int J = (int)(scaleJ * Y);
+            scaleI = (scaleI < 1) ? 1 : scaleI;
+            scaleJ = (scaleJ < 1) ? 1 : scaleJ;
+            int lengthI = (int)scaleI + I;
+            int lengthJ = (int)scaleJ + J;
+            List<Color> colors = new List<Color>();
+            for (int i = I; i < lengthI; i++)
+            {
+                for (int j = J; j < lengthJ; j++)
+                {
+                    colors.Add(tex.GetPixel(i, j));
+                }
+            }
+
+            int length = colors.Count;
+            int m1 = length / 2;
+            return colors[m1];
+        };
+        Texture2D texResize = new Texture2D(_Width, _Height);
+        for (int x = 0; x < _Width; x++)
+        {
+            for (int y = 0; y < _Height; y++)
+            {
+                Color col = convert(oldTex, x, y);
+                texResize.SetPixel(x, y, col);
+            }
+        }
+        return texResize;
+    }
+
+    public void SetAllVoicesMute(bool _muted)
+    {
+        //_MutedAllVoices = _muted;
+        _SoundInput.MuteAllVoices(_muted);
+    }
+
+    public bool SetMicState()
+    {
+        return _SoundInput.MicActive();
+    }
+
+    public void SetCameraDeviceState(bool _opened)
+    {
+        if (_opened) //OpenTheCamera
+        {
+            _DeviceStatus = (int)StreamState.TRYINGTOCONNECT;
+            int deviceCount = WebCamTexture.devices.Length;
+            if (deviceCount > 0)
+            {
+                StartCoroutine(OpenTheCamera(1));
+            }
+            else
+            {
+                if (GetComponent<UIVideoCall>() != null)
+                {
+                    UIVideoCall _UIvideocall = GetComponent<UIVideoCall>();
+                    _UIvideocall.BtnOffClicked();
+                }
+            }
+        }
+        else
+        {
+            StopCoroutine(OpenTheCamera(1));
+            _BackCam.Stop();
+            _Background.gameObject.SetActive(false);
+            ResetStreamObjects();
+
+            _DeviceStatus = ((int)StreamState.ALLCLOSE); //0 Video and voice open, 1 video without voice, 2 all close
+
+            if (node.CurrentMode == APNode.Mode.Server || node.CurrentMode == APNode.Mode.Client)
+            {
+                //LeaveRoom();
+            }
+
+            UpdatePlayerHashes();
+        }
+    }
+
+    private IEnumerator OpenTheCamera(float waitTime)
+    {
+        for (int i = 0; i < 3;)
+        {
+            _DeviceStatus = (int)StreamState.TRYINGTOCONNECT;
+            _Background.texture = _WaitingBgForStream;
+
+            yield return new WaitForSeconds(waitTime);
+            _BackCam.Stop(); _BackCam.Play();
+            _BackCam.Stop(); _BackCam.Play();
+            if (_BackCam.didUpdateThisFrame)
+            {
+                _DeviceStatus = ((int)StreamState.NORMALSTREAMING); //0 Video and voice open, 1 video without voice, 2 all close
+                _Background.gameObject.SetActive(true);
+                _Background.texture = _BackCam;
+                Debug.LogError("Webcam Opened Right now.");
+
+                UpdatePlayerHashes();
+            }
+            else
+            {
+                _DeviceStatus = (int)StreamState.ALLCLOSE;
+                Debug.LogError("Webcam could not start.");
+            }
+            i++;
+        }
+        if (_DeviceStatus == (int)StreamState.ALLCLOSE || _DeviceStatus == (int)StreamState.TRYINGTOCONNECT)
+        {
+            if (node.CurrentMode == APNode.Mode.Client || node.CurrentMode == APNode.Mode.Server)
+            {
+                //LeaveRoom();
+            }
+            if (GetComponent<UIVideoCall>() != null)
+            {
+                UIVideoCall _UIvideocall = GetComponent<UIVideoCall>();
+                _UIvideocall.BtnOffClicked();
+            }
+        }
+    }
+
+    public void SetResolution(int id)
+    {
+        _WidthMyCam = (int)_Resolutions[id].x;
+        _Width = (int)_Resolutions[id].x;
+        _HeightMyCam = (int)_Resolutions[id].y;
+        _Height = (int)_Resolutions[id].z;
+
+        _ResolationSetting = id;
+    }
+
+    private bool checkCondition()
+    {
+        if (node.CurrentMode == APNode.Mode.Server || node.CurrentMode == APNode.Mode.Client)
+        {
+            return false;
+        }
+        if (BusyNow)
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    public void JoinRoom(string roomName)
+    {
+        if (_ServerOverloaded)
+        {
+            Debug.LogError("ServerOverloaded now! Please wait: " + Mathf.RoundToInt(_RestTimer) + " seconds!");
+            LeaveRoom();
+            return;
+        }
+
+        if (!checkCondition())
+            return;
+        BusyNow = true;
+        node.Connect(roomName);
+    }
+
+    public void CreateRoom(string roomName)
+    {
+        if (_ServerOverloaded)
+        {
+            Debug.LogError("ServerOverloaded now! Please wait: " + Mathf.RoundToInt(_RestTimer) + " seconds!");
+            LeaveRoom();
+            return;
+        }
+        if (!checkCondition())
+            return;
+        BusyNow = true;
+        if (roomName == string.Empty)
+        {
+            Debug.LogError("ServerName empty cant create a server");
+            return;
+        }
+        node.StartServer(roomName);
+        _TemporaryServerName = roomName;
+    }
+
+    public void LeaveRoom()
+    {
+        LeaveRoomOptimized();
+    }
+
+    public int GetPeersCount()
+    {
+        return _CurrentPlayerCount;
+    }
+
+    public int GetPeerID()
+    {
+        return _MyServerID;
+    }
+
+    public string GetServerName()
+    {
+        return _CurrentServerName;
+    }
+
+    public void setPlayerController(PlayerController pc)
+    {
+        _PlayerController = pc;
+    }
+
+    public void UpdatePlayerHashes()
+    {
+        if (_GuestController != null)
+            _GuestController.UpdateProperties();
+        if (_PlayerController != null)
+            _PlayerController.UpdateProperties(0);
+    }
+
+    public void SetNearestPlayersList(List<GameObject> _nearest)
+    {
+        _NearPlayersInSameServer = _nearest;
+    }
+
+    public void MuteAPlayer(int id)
+    {
+        string playerName = (string)_NearPlayersInSameServer[id].GetComponent<PhotonView>().Owner.CustomProperties["UserID"];
+        _SoundInput.AddPlayerToMuteList(playerName);
+    }
+
+    public void UnmuteAPlayer(int id)
+    {
+         string playerName = (string)_NearPlayersInSameServer[id].GetComponent<PhotonView>().Owner.CustomProperties["UserID"];
+        _SoundInput.RemovePlayerToMuteList(playerName);
+    }
+
+    public bool OrderedPlayerisMuted(int id)
+    {
+        string playerName = (string)_NearPlayersInSameServer[id].GetComponent<PhotonView>().Owner.CustomProperties["UserID"];
+        return _SoundInput.CheckTheListForMutedPlayer(playerName);
+    }
+
+    public int GetDeviceStatus()
+    {
+        return _DeviceStatus;
+        //return 0;
+    }
+    public APNode.Mode getState()
+    {
+        return node.CurrentMode;
+    }
+
+    string msg;
+    string address = "address";
+    string textInput;
+
+    private void CheckTheServerThread()
+    {
+        if (!_ServerOverloaded)
+        {
+            int length = node.Peers.Count;
+            int distinctCount = node.Peers.Distinct().Count();
+            if (length != distinctCount)
+            {
+                string over = "Over";
+                node.SendPacket(node.Peers[0], new Packet().WithTag(over), true);
+                _ServerOverloaded = true;
+                _RestTimer = 10;
+                RefreshServer();
+            }
+        }
+    }
+
+    private void OnGUI()
+    {
+        int hight = 300;
+        int height = 20;
+        int count = 0;
+        int getHeight()
+        {
+            var value = height * count;
+            count++;
+            return value;
+        }
+
+        GUI.Label(new Rect(0, getHeight() + hight, 4000, height), msg);
+        var label = node.CurrentMode == APNode.Mode.Idle ? "Not Connected. Mode" : (node.CurrentMode == APNode.Mode.Client ? "I am Client" : "I am Server") + " ID : " + node.ID;
+
+        GUI.Label(new Rect(0, getHeight() + hight, 400, height), label);
+        address = GUI.TextField(new Rect(0, getHeight() + hight, 400, height), address);
+
+        if (GUI.Button(new Rect(0, getHeight() + hight, 400, height), "Create"))
+            node.StartServer(address);
+        if (GUI.Button(new Rect(0, getHeight() + hight, 400, height), "Join"))
+            node.Connect(address);
+        if (GUI.Button(new Rect(0, getHeight() + hight, 400, height), "Leave"))
+        {
+            if (node.CurrentMode == APNode.Mode.Server)
+                node.StopServer();
+            else
+                node.Disconnect();
+        }
+
+        textInput = GUI.TextField(new Rect(0, getHeight() + hight, 400, height), textInput);
+
+        if (GUI.Button(new Rect(0, getHeight() + hight, 400, height), "Send Message"))
+        {
+            node.SendPacket(node.Peers, new Packet().WithTag(textInput), true);
+            textInput = "";
+        }
+
+        if (GUI.Button(new Rect(0, getHeight() + hight, 400, height), "Print Peers"))
+        {
+            var str = "PEERS : [";
+            foreach (var p in node.Peers)
+                str += p + "  ";
+            str += "]";
+            msg = (str);
+            address = _CurrentServerName;
+        }
+    }
+
+    private void RefreshServer()
+    {
+        _OnRefresh = true;
+        UIVideoCall _UIvideocall = GetComponent<UIVideoCall>();
+        _UIvideocall.BtnOffClicked();
+
+        if (node.CurrentMode != APNode.Mode.Idle)
+        {
+            BusyNow = false;
+            LeaveRoom();
+        }
+    }
+
+    void CreateTheServerSystem()
+    {
+        node = new APNode(SignalingServerURL, new string[]{
+                "stun:stun.l.google.com:19302"
+            });
+        //When someone creates a server this function will be called!
+        node.OnServerStartSuccess += () =>
+        {
+            msg = ("Server started.");
+            _CurrentPlayerCount = 1;
+            UpdatePlayerHashes();
+            BusyNow = false;
+
+            ResetStreamObjects();
+        };
+
+        node.OnServerStartFailure += ex =>
+        {
+            //BusyNow = false;
+            BusyJoining = true;
+            if (_TemporaryServerName != string.Empty)
+            {
+                StartCoroutine(JoinRoomOptimized(_TemporaryServerName));
+            }
+            else
+            {
+                Debug.LogError("Joining Server Name is empty!");
+            }
+            msg = ("Server could not start " + ex);
+
+            ResetStreamObjects();
+        };
+
+        node.OnServerStop += () =>
+        {
+            msg = ("Server stopped");
+            _CurrentServerName = "";
+            _CurrentPlayerCount = 0;
+            _MyServerID = -1;
+            UpdatePlayerHashes();
+            BusyNow = false;
+            BusyClosing = false;
+            if (_OnRefresh)
+            {
+                Destroy(obj: FindObjectOfType<APNetwork>().gameObject);
+                CreateTheServerSystem();
+                SetStreamScreensOff();
+                _OnRefresh = false;
+            }
+
+            ResetStreamObjects();
+        };
+
+        node.OnConnected += () =>
+        {
+            msg = ("Connected");
+            //BusyNow = false;
+
+            ResetStreamObjects();
+        };
+
+        node.OnDisconnected += () =>
+        {
+            msg = ("Disconnected from server");
+            _CurrentServerName = "";
+            _CurrentPlayerCount = 0;
+            _MyServerID = -1;
+            UpdatePlayerHashes();
+            BusyNow = false;
+            BusyClosing = false;
+            if (_OnRefresh)
+            {
+                Destroy(obj: FindObjectOfType<APNetwork>().gameObject);
+                CreateTheServerSystem();
+                SetStreamScreensOff();
+                _OnRefresh = false;
+            }
+
+            ResetStreamObjects();
+        };
+
+        node.OnConnectionFailed += ex =>
+        {
+            _DisconnectedAmount++;
+            BusyNow = false;
+
+            msg = ("Could not connect to server " + ex);
+
+            _CurrentServerName = "";
+            _CurrentPlayerCount = 0;
+            _MyServerID = -1;
+            UpdatePlayerHashes();
+
+            ResetStreamObjects();
+        };
+
+        node.OnClientJoined += id =>
+        {
+            msg = "Client #" + id + " connected";
+            _CurrentPlayerCount = node.Peers.Count + 1;
+            UpdatePlayerHashes();
+
+            ResetStreamObjects();
+        };
+
+        node.OnClientLeft += id =>
+        {
+            msg = "Client #" + id + " left";
+            _CurrentPlayerCount = node.Peers.Count + 1;
+            UpdatePlayerHashes();
+
+            ResetStreamObjects();
+        };
+
+        //When someone creates or join into a server this function will be called!
+        node.OnReceiveID += id =>
+        {
+            _DisconnectedAmount = 0;
+            msg = ("Assigned ID " + id);
+            BusyNow = false;
+            BusyJoining = false;
+            _MyServerID = id;
+            _CurrentPlayerCount = node.Peers.Count + 1;
+            _CurrentServerName = node.Address;
+            UpdatePlayerHashes();
+            ResetStreamObjects();
+        };
+
+        node.OnPacketReceived += (id, packet) =>
+        {
+            if (node.CurrentMode == APNode.Mode.Server)
+            {
+                if (packet.Tag == "Over")
+                {
+                    Debug.LogError("Overloaded shutdown!");
+                    RefreshServer();
+                    return;
+                }
+            }
+            int GameObjectPeerID = -1;
+            string PlayerName = "";
+            string _emptyData = "";
+            string Tag = packet.Tag;
+            if (Tag.Contains("tag"))
+            {
+                string[] splitArray = Tag.Split(char.Parse("[")); //Example => tag_0_PlayerName_0
+                                                                      
+                GameObjectPeerID = int.Parse(splitArray[1]);
+                PlayerName = splitArray[2];
+                _emptyData = splitArray[3];
+                Debug.LogError("Tagged package PeerID/PlayerName/EmptyData?: " + GameObjectPeerID + "/" + PlayerName + "/" + _emptyData);
+            }
+
+            if (Tag.Contains("Leaving"))
+            {
+                string[] splitArray = Tag.Split(char.Parse("["));
+                if (_LeavingPlayersList.Contains(short.Parse(splitArray[1])))
+                {
+                    Debug.LogError("Player: " + splitArray[1] + " will leave from server, dont send data to him");
+                    _LeavingPlayersList.Add(short.Parse(splitArray[1]));
+                }
+            }
+
+            var reader = new BytesReader(packet.Payload);
+
+            Debug.LogError("You get data from id: " + id);
+            //GettingDataWithAudio(reader,id);
+            GettingDatajustTexture(reader, id, GameObjectPeerID, PlayerName, _emptyData);
+        };
+
+        node.OnBytesReceived += (id, bytes) =>
+        {
+            msg = ("Message received from peer #" + id + " : " + bytes.Length);
+        };
+    }
+
+    private void SendDataToWebRTcServer(BytesWriter _writer)
+    {
+        int length = node.Peers.Count; //Exclude me, this function gives a total number - 1(me)
+        int length2 = _NearPlayersInSameServer.Count; //Exclude me, this function gives a total number - 1(me)
+
+        if (length2 == 0 || length == 0)
+        {
+            ResetStreamObjects();
+            return;
+        }
+
+        string tag = "tag";
+        string peerid = "" + _MyServerID;
+        string _MyName = MyName;
+        string emptyData;
+        if (_DeviceStatus == 0 || _DeviceStatus == 1)
+            emptyData = "1";
+        else if (_DeviceStatus == 2)
+            emptyData = "0";
+        else
+            emptyData = "2";
+
+        if (length == length2 && _LeavingPlayersList.Count == 0)
+        {
+            string _Tag = tag + "[" + peerid + "[" + _MyName + "[" + emptyData;
+            Packet packet = new Packet();
+            packet.WithTag(_Tag);
+            if (emptyData == "1")
+                packet.WithPayload(_writer.Bytes);
+            node.SendPacket(node.Peers, packet);
+        }
+        else
+        {
+            for (int i = length2 - 1; i >= 0; i--)
+            {
+                if (_NearPlayersInSameServer[i] == null)
+                {
+                    _NearPlayersInSameServer.RemoveAt(i);
+                    continue;
+                }
+
+                PhotonView pv = _NearPlayersInSameServer[i].GetComponent<PhotonView>();
+                int serverOrder = (int)pv.Owner.CustomProperties["PeerID"];
+                Debug.LogError("Sending Data To specific id: " + serverOrder + " -name: " + _NearPlayersInSameServer[i].GetComponent<PhotonPlayer>()._PlayerName.text);
+                for (int x = 0; x < length; x++)
+                {
+                    if (node.Peers[x] == serverOrder)
+                    {
+                        if (_LeavingPlayersList.Contains(node.Peers[x]))
+                        {
+                            Debug.LogWarning("This player will exit from server, dont send data to him.");
+                            break;
+                        }
+                        else
+                        {
+                            string _Tag = tag + "[" + serverOrder + "[" + _MyName + "[" + emptyData;
+                            Packet packet = new Packet();
+                            packet.WithTag(_Tag);
+                            if (emptyData == "1")
+                                packet.WithPayload(_writer.Bytes);
+                            node.SendPacket(node.Peers[x], packet);
+                            //node.SendPacket(node.Peers[serverOrder], new Packet().WithPayload(_writer.Bytes));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private void GettingDatajustTexture(BytesReader reader, int id, int gameobjectPeerid, string _PlayerName, string EmptyData)
+    {
+        Texture2D texture = new Texture2D(_Width, _Height);
+        if (EmptyData == "0")
+        {
+            Debug.LogError("Data is empty will not apply!");
+            texture = _NoCameraTexture;
+            texture.Apply();
+        }
+        else if (EmptyData == "1")
+        {
+            bool getTexture = texture.LoadImage(reader.ReadByteArray());
+            texture.Apply();
+        }
+        else //Trying to join now.
+        {
+            texture = _WaitingBgForStream;
+            texture.Apply();
+        }
+
+        ResetStreamObjects();
+        int length = _NearPlayersInSameServer.Count;
+        int orderOfData = -1;
+
+        string PlayerName = _PlayerName;
+        for (int i = 0; i < length; i++)
+        {
+            //int nodeIDs = gameobjectPeerid;
+
+            if (_PlayerName == _NearPlayersInSameServer[i].GetComponent<PhotonPlayer>()._PlayerName.text)
+            {
+                orderOfData = i;
+                Debug.LogError("Order of player -" + _PlayerName + "-: " + orderOfData);
+                break;
+            }
+        }
+
+        if (orderOfData >= 0)
+        {
+            int length3 = _ShownPlayersList.Count;
+            for (int i = 0; i < length3; i++)
+            {
+                if (_ShownPlayersList.Contains(PlayerName))
+                {
+                    _DestinationBgUp[orderOfData].gameObject.SetActive(true);
+                    _DestinationBgUp[orderOfData].texture = texture;
+                    _DestinationBgRight[orderOfData].gameObject.SetActive(true);
+                    _DestinationBgRight[orderOfData].texture = texture;
+                    break;
+                }
+                else
+                {
+                    _DestinationBgUp[orderOfData].texture = _NoCameraTexture;
+                    _DestinationBgRight[orderOfData].texture = _NoCameraTexture;
+                    _DestinationBgUp[orderOfData].gameObject.SetActive(false);
+                    _DestinationBgRight[orderOfData].gameObject.SetActive(false);
+                }
+            }
+        }
+        else
+            Debug.LogError("Data Owner not exist!");
+    }
+
+    public void AddPlayerToShownList(int id)
+    {
+        string PlayerNametext = _PlayerNameButtonList[id].transform.GetChild(0).GetComponent<TMPro.TextMeshProUGUI>().text;
+        if (PlayerNametext == "")
+        {
+            Debug.LogError("Does not contains a name, have a problem!");
+            return;
+        }
+        else
+        {
+            int length = _ShownPlayersList.Count;
+            if (length > 0)
+            {
+                bool contains = false;
+                for (int i = 0; i < length; i++)
+                {
+                    if (_ShownPlayersList.Contains(PlayerNametext))
+                    {
+                        contains = true;
+                        _ShownPlayersList.Remove(PlayerNametext);
+                        Debug.LogError("You deleted the name List count: " + _ShownPlayersList.Count + " . Deleted Player Name: " + PlayerNametext);
+                        break;
+                    }
+                }
+                if (!contains)
+                {
+                    _ShownPlayersList.Add(PlayerNametext);
+                    Debug.LogError("You added the name List count: " + _ShownPlayersList.Count + " . added Player Name: " + PlayerNametext);
+                }
+            }
+            else
+            {
+                _ShownPlayersList.Add(PlayerNametext);
+                Debug.LogError("You added the name List count: " + _ShownPlayersList.Count + " . added Player Name: " + PlayerNametext);
+            }
+        }
+    }
+
+    public IEnumerator JoinRoomOptimized(string roomName)
+    {
+        if (BusyJoining)
+        {
+            Debug.LogError("Trying to joining server");
+            yield return new WaitForSeconds(2);
+            Debug.LogError("Connected to server");
+            node.Connect(roomName);
+        }
+    }
+
+    public void LeaveRoomOptimized()
+    {
+        if (BusyNow || BusyClosing)
+        {
+            return;
+        }
+        BusyNow = true;
+        BusyClosing = true;
+        if (node.CurrentMode == APNode.Mode.Server)
+        {
+            StartCoroutine(LeaveRoomOptimizeNumerator(true));
+        }
+        else if (node.CurrentMode == APNode.Mode.Client)
+        {
+            StartCoroutine(LeaveRoomOptimizeNumerator(false));
+        }
+    }
+
+    IEnumerator LeaveRoomOptimizeNumerator(bool Master)
+    {
+        if (BusyClosing)
+        {
+            string _Tag = "Leaving" + "[" + _MyServerID;
+            Packet packet = new Packet();
+            packet.WithTag(_Tag);
+            node.SendPacket(node.Peers, packet);
+
+            Debug.LogError("Trying to leaving server");
+            yield return new WaitForSeconds(2);
+            if (Master)
+            {
+                node.StopServer();
+                Debug.LogError("Closed The Server");
+            }
+            else
+            {
+                node.Disconnect();
+                Debug.LogError("Disconnected from Server");
+            }
+        }
+    }
+}

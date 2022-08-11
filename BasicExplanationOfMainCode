@@ -1,0 +1,236 @@
+//Basicly we translate everything to byte to compress data, send and receiver translate from byte to texture2d and float signals data
+
+private void Start()
+    {
+        //We get the Link
+        SignalingServerURL = Velaverse.Constant.SignalingServerURL;
+	
+        _ResolationSetting = 1; //Image Quality settings
+        SetResolution(_ResolationSetting); //Apply the quality settings
+
+        _SampleRate = 16000; //Quality of voice chat
+        _buffer = new List<float>(); // Buffer array to keep voice bytes
+        _rawSamples = new float[Constants.RecordingTime * _SampleRate]; // Samples per fram for voice
+
+        _MutedAllVoices = false;
+
+        _Background.gameObject.SetActive(false);
+        _BackCam = new WebCamTexture(_WidthMyCam, _HeightMyCam, 5);
+
+        _MyAudioSource.clip = _MyAudioClip;
+
+        ResetStreamObjects();
+
+        //We create a server systems
+        CreateTheServerSystem();
+        SetCameraDeviceState(false);
+    }
+
+
+ private void Update()
+    {
+        if (node.CurrentMode != APNode.Mode.Idle && !BusyClosing) //if not idle, means We has a server, owner or the joiner.
+        {
+            _Time -= Time.deltaTime;
+            if (_Time < 0)
+            {
+                StreamVideo();
+                _Time = 0.1f; // Send Image step, 10 times in a seconds for now
+            }
+        }
+    }
+
+public void StreamVideo()
+    {
+        if (node != null && _BackCam != null)
+        {
+            var writer = new BytesWriter(); //We create A writer to send and for other players when get data we creates a reader to get data
+            if (_DeviceStatus == 0 || _DeviceStatus == 1) //This mean if our camera Open in the script.
+            {
+                Texture2D snap = new Texture2D(_BackCam.width, _BackCam.height); //We create a new texture with Our prefered size
+                snap.SetPixels32(_BackCam.GetPixels32()); //And we apply the Our RawImage pixels to here (Our active video Image)
+                snap.Apply(); //Apply it.
+                writer.WriteByteArray(GetResizeText(snap).EncodeToJPG()); //After apply turn the data to bytes to compress
+            }
+
+		//Normally here we should turn voice to bytes too and use "writer.WriteByteArray(VoiceBytes)" onto it, and send both of them in the writer.
+
+            SendDataToWebRTcServer(writer); //And send to writer for prepare
+        }
+    }
+
+
+
+private void SendDataToWebRTcServer(BytesWriter _writer)
+    {
+        int length = node.Peers.Count; //Exclude me, this function gives a total number - 1(me)	
+        int length2 = _NearPlayersInSameServer.Count; //Exclude me, this function gives a total number - 1(me)
+
+        if (length2 == 0 || length == 0) // If noone in the server or noone near bymyside, dont send data to anyone, so close UI and return.
+        {
+            ResetStreamObjects();
+            return;
+        }
+
+	//We create A pocket to keep more datas
+        string tag = "tag"; //Tag, to understand what we send from its tag
+        string peerid = "" + _MyServerID; // my PeerID
+        string _MyName = MyName; //My player name
+        string emptyData; //Player camera close, open or trying to connect ?
+        if (_DeviceStatus == 0 || _DeviceStatus == 1)
+            emptyData = "1";
+        else if (_DeviceStatus == 2)
+            emptyData = "0";
+        else
+            emptyData = "2";
+
+        if (length == length2 && _LeavingPlayersList.Count == 0) //If everyone in the server near to me, so I send data to everyone directly
+        {
+            string _Tag = tag + "[" + peerid + "[" + _MyName + "[" + emptyData;
+            Packet packet = new Packet();
+            packet.WithTag(_Tag);
+            if (emptyData == "1")
+                packet.WithPayload(_writer.Bytes);
+            node.SendPacket(node.Peers, packet);
+        }
+        else //If some of the peopler far from me but still in the same server, So I find the near players Peer Id And I send data only near ones.
+        {
+            for (int i = length2 - 1; i >= 0; i--)
+            {
+                if (_NearPlayersInSameServer[i] == null)
+                {
+                    _NearPlayersInSameServer.RemoveAt(i);
+                    continue;
+                }
+
+                PhotonView pv = _NearPlayersInSameServer[i].GetComponent<PhotonView>();
+                int serverOrder = (int)pv.Owner.CustomProperties["PeerID"];
+                Debug.LogError("Sending Data To specific id: " + serverOrder + " -name: " + _NearPlayersInSameServer[i].GetComponent<PhotonPlayer>()._PlayerName.text);
+                for (int x = 0; x < length; x++)
+                {
+                    if (node.Peers[x] == serverOrder)
+                    {
+                        if (_LeavingPlayersList.Contains(node.Peers[x]))
+                        {
+                            Debug.LogWarning("This player will exit from server, dont send data to him.");
+                            break;
+                        }
+                        else
+                        {
+                            string _Tag = tag + "[" + serverOrder + "[" + _MyName + "[" + emptyData;
+                            Packet packet = new Packet();
+                            packet.WithTag(_Tag);
+                            if (emptyData == "1")
+                                packet.WithPayload(_writer.Bytes);
+                            node.SendPacket(node.Peers[x], packet);
+                            //node.SendPacket(node.Peers[serverOrder], new Packet().WithPayload(_writer.Bytes));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+
+//After that getting Data
+
+//When player gets any data it calls an action
+
+node.OnPacketReceived += (id, packet) =>
+        {
+            int GameObjectPeerID = -1;
+            string PlayerName = "";
+            string _emptyData = "";
+            string Tag = packet.Tag;
+            if (Tag.Contains("tag")) //From the tag of data we can Understand which data we get right now and access up to it
+            {
+                string[] splitArray = Tag.Split(char.Parse("[")); //Example => tag_0_PlayerName_0
+                                                                      
+                GameObjectPeerID = int.Parse(splitArray[1]);
+                PlayerName = splitArray[2];
+                _emptyData = splitArray[3];
+                Debug.LogError("Tagged package PeerID/PlayerName/EmptyData?: " + GameObjectPeerID + "/" + PlayerName + "/" + _emptyData);
+            }
+
+            if (Tag.Contains("Leaving")) //From the tag of data we can Understand which data we get right now and access up to it
+            {
+                string[] splitArray = Tag.Split(char.Parse("["));
+                if (_LeavingPlayersList.Contains(short.Parse(splitArray[1])))
+                {
+                    Debug.LogError("Player: " + splitArray[1] + " will leave from server, dont send data to him");
+                    _LeavingPlayersList.Add(short.Parse(splitArray[1]));
+                }
+            }
+
+            var reader = new BytesReader(packet.Payload); // We create a reader to turn datas from byte to pic and signal for voice, for now in the script has just picture so We just turn the picture
+//Important, if you send picture first from writer, you should read picture first with reader, order is important.
+
+            Debug.LogError("You get data from id: " + id);
+            //GettingDataWithAudio(reader,id);
+            GettingDatajustTexture(reader, id, GameObjectPeerID, PlayerName, _emptyData);
+        };
+
+
+private void GettingDatajustTexture(BytesReader reader, int id, int gameobjectPeerid, string _PlayerName, string EmptyData)
+    {
+        Texture2D texture = new Texture2D(_Width, _Height);
+        if (EmptyData == "0")
+        {
+            Debug.LogError("Data is empty will not apply!");
+            texture = _NoCameraTexture;
+            texture.Apply();
+        }
+        else if (EmptyData == "1")
+        {
+            bool getTexture = texture.LoadImage(reader.ReadByteArray()); // We create a texture2d variable again and with this func we translate the bytes to pixels
+            texture.Apply(); //Should not forget to apply to see!
+        }
+        else //Trying to join now.
+        {
+            texture = _WaitingBgForStream;
+            texture.Apply();
+        }
+	//Other things to set UI in the under
+        ResetStreamObjects();
+        int length = _NearPlayersInSameServer.Count;
+        int orderOfData = -1;
+
+        string PlayerName = _PlayerName;
+        for (int i = 0; i < length; i++)
+        {
+            //int nodeIDs = gameobjectPeerid;
+
+            if (_PlayerName == _NearPlayersInSameServer[i].GetComponent<PhotonPlayer>()._PlayerName.text)
+            {
+                orderOfData = i;
+                Debug.LogError("Order of player -" + _PlayerName + "-: " + orderOfData);
+                break;
+            }
+        }
+
+        if (orderOfData >= 0)
+        {
+            int length3 = _ShownPlayersList.Count;
+            for (int i = 0; i < length3; i++)
+            {
+                if (_ShownPlayersList.Contains(PlayerName))
+                {
+                    _DestinationBgUp[orderOfData].gameObject.SetActive(true);
+                    _DestinationBgUp[orderOfData].texture = texture;
+                    _DestinationBgRight[orderOfData].gameObject.SetActive(true);
+                    _DestinationBgRight[orderOfData].texture = texture;
+                    break;
+                }
+                else
+                {
+                    _DestinationBgUp[orderOfData].texture = _NoCameraTexture;
+                    _DestinationBgRight[orderOfData].texture = _NoCameraTexture;
+                    _DestinationBgUp[orderOfData].gameObject.SetActive(false);
+                    _DestinationBgRight[orderOfData].gameObject.SetActive(false);
+                }
+            }
+        }
+        else
+            Debug.LogError("Data Owner not exist!");
+    }
